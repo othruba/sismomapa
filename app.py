@@ -1,11 +1,11 @@
 import os
 from datetime import date, datetime, time, timedelta, timezone
+from math import log, pi, radians, tan
 from pathlib import Path
 from time import perf_counter
 
 import clickhouse_connect
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -64,11 +64,7 @@ def consultar_eventos(data_inicial, data_final, magnitude, local):
 
     consulta_resumo = f"""
         SELECT
-            count() AS total,
-            min(latitude) AS latitude_min,
-            max(latitude) AS latitude_max,
-            min(longitude) AS longitude_min,
-            max(longitude) AS longitude_max
+            count() AS total
         FROM terremotos
         WHERE {filtros}
     """
@@ -89,15 +85,49 @@ def consultar_eventos(data_inicial, data_final, magnitude, local):
     return {
         "eventos": eventos,
         "total": int(resumo[0]),
-        "limites": resumo[1:],
         "duracao": duracao,
         "busca_local": bool(local),
     }
 
 
-def criar_mapa(eventos, limites=None):
+def calcular_visao_mapa(eventos):
+    coordenadas = eventos[["latitude", "longitude"]].dropna()
+    lat_min = max(-85, coordenadas["latitude"].min())
+    lat_max = min(85, coordenadas["latitude"].max())
+    lon_min = coordenadas["longitude"].min()
+    lon_max = coordenadas["longitude"].max()
+
+    # Uma margem mínima evita um zoom excessivo quando todos os eventos estão
+    # no mesmo ponto ou muito próximos entre si.
+    margem_lat = max((lat_max - lat_min) * 0.15, 0.15)
+    margem_lon = max((lon_max - lon_min) * 0.15, 0.15)
+    sul = max(-85, lat_min - margem_lat)
+    norte = min(85, lat_max + margem_lat)
+    oeste = max(-180, lon_min - margem_lon)
+    leste = min(180, lon_max + margem_lon)
+
+    def latitude_mercator(latitude):
+        return log(tan(pi / 4 + radians(latitude) / 2))
+
+    fracao_lat = abs(latitude_mercator(norte) - latitude_mercator(sul)) / (2 * pi)
+    fracao_lon = (leste - oeste) / 360
+    zoom_lat = log(630 / (512 * fracao_lat), 2)
+    zoom_lon = log(750 / (512 * fracao_lon), 2)
+
+    return {
+        "center": {"lat": (sul + norte) / 2, "lon": (oeste + leste) / 2},
+        "zoom": max(0.7, min(10.5, zoom_lat, zoom_lon)),
+    }
+
+
+def criar_mapa(eventos, ajustar_aos_pontos=False):
     dados_mapa = eventos.copy()
     dados_mapa["tamanho_marcador"] = dados_mapa["mag"].clip(lower=0.5) ** 3
+    opcoes_iniciais = {}
+    if ajustar_aos_pontos:
+        opcoes_iniciais = calcular_visao_mapa(dados_mapa)
+    else:
+        opcoes_iniciais = {"zoom": 0.7, "center": {"lat": 15, "lon": 0}}
 
     figura = px.scatter_map(
         dados_mapa,
@@ -107,8 +137,6 @@ def criar_mapa(eventos, limites=None):
         color="depth",
         color_continuous_scale="Turbo",
         size_max=34,
-        zoom=0.7,
-        center={"lat": 15, "lon": 0},
         map_style="carto-positron",
         opacity=0.78,
         hover_name="place",
@@ -125,6 +153,7 @@ def criar_mapa(eventos, limites=None):
             "mag": "Magnitude",
             "depth": "Profundidade (km)",
         },
+        **opcoes_iniciais,
     )
 
     figura.update_layout(
@@ -133,29 +162,46 @@ def criar_mapa(eventos, limites=None):
         coloraxis_colorbar={"title": "Profundidade<br>(km)"},
     )
 
-    if limites and all(valor is not None for valor in limites):
-        lat_min, lat_max, lon_min, lon_max = limites
-        margem_lat = max((lat_max - lat_min) * 0.12, 2)
-        margem_lon = max((lon_max - lon_min) * 0.12, 2)
-        sul = max(-85, lat_min - margem_lat)
-        norte = min(85, lat_max + margem_lat)
-        oeste = max(-180, lon_min - margem_lon)
-        leste = min(180, lon_max + margem_lon)
+    return figura
 
-        figura.add_trace(
-            go.Scattermap(
-                lat=[sul, sul, norte, norte],
-                lon=[oeste, leste, oeste, leste],
-                mode="markers",
-                marker={"size": 1, "opacity": 0},
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-        figura.layout.map.center = None
-        figura.layout.map.zoom = None
-        figura.update_layout(map_fitbounds="locations")
 
+def criar_grafico_dispersao(eventos):
+    dados_grafico = eventos.copy()
+    dados_grafico["tamanho_marcador"] = dados_grafico["mag"].clip(lower=0.1) ** 5
+
+    figura = px.scatter(
+        dados_grafico,
+        x="time",
+        y="depth",
+        size="tamanho_marcador",
+        size_max=48,
+        opacity=0.7,
+        hover_name="place",
+        hover_data={
+            "time": "|%d/%m/%Y %H:%M UTC",
+            "mag": ":.1f",
+            "depth": ":.1f",
+            "latitude": ":.3f",
+            "longitude": ":.3f",
+            "tamanho_marcador": False,
+        },
+        labels={
+            "time": "Data",
+            "depth": "Profundidade (km)",
+            "mag": "Magnitude",
+        },
+    )
+    figura.update_layout(
+        height=440,
+        margin={"l": 0, "r": 0, "t": 10, "b": 0},
+        showlegend=False,
+    )
+
+    figura.update_yaxes(
+        range=[
+            dados_grafico["depth"].max(),
+            dados_grafico["depth"].min()
+        ])
     return figura
 
 
@@ -217,5 +263,9 @@ if total > len(eventos):
         f"O mapa mostra os {LIMITE_MAPA:,} eventos de maior magnitude.".replace(",", ".")
     )
 
-limites = resultado["limites"] if resultado["busca_local"] else None
-st.plotly_chart(criar_mapa(eventos, limites), width="stretch")
+st.plotly_chart(
+    criar_mapa(eventos, ajustar_aos_pontos=resultado["busca_local"]), width="stretch"
+)
+
+st.subheader("Eventos sísmicos por data e profundidade")
+st.plotly_chart(criar_grafico_dispersao(eventos), width="stretch")
